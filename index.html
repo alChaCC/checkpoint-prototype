@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>檢查點原型</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root { --bg:#fff; --fg:#222; --muted:#666; --ok:#1a8f3c; --warn:#c77700; --accent:#2563eb; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,sans-serif; }
+  body { display:flex; flex-direction:column; }
+  #status { padding:8px 12px; font-size:13px; color:var(--muted); border-bottom:1px solid #ddd; }
+  #map { flex:1; min-height:300px; }
+  #panel { padding:12px; border-top:1px solid #ddd; }
+  #modes { display:flex; gap:16px; font-size:14px; margin-bottom:8px; }
+  #list { list-style:none; padding:0; margin:0 0 6px; font-size:15px; }
+  #list li { padding:4px 0; }
+  #flags { font-family:ui-monospace,monospace; font-size:13px; color:var(--muted); margin-bottom:8px; }
+  .done { color:var(--ok); }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; }
+  button, label.btn { flex:1; padding:12px; font-size:16px; border:0; border-radius:8px; background:var(--accent); color:#fff; text-align:center; }
+  button:disabled { background:#aaa; }
+  #msg { margin-top:10px; font-weight:600; min-height:1.2em; }
+  .sim { font-size:13px; color:var(--muted); margin-top:8px; display:block; }
+</style>
+</head>
+<body>
+<div id="status">尚未定位</div>
+<div id="map"></div>
+<div id="panel">
+  <div id="modes">
+    <label><input type="radio" name="mode" value="street" checked> 街道（1D，±25 m）</label>
+    <label><input type="radio" name="mode" value="radius"> 圓形範圍（2D，50 m）</label>
+  </div>
+  <ul id="list"></ul>
+  <div id="flags"></div>
+  <div class="btns">
+    <button id="start">開始</button>
+    <button id="checkin" disabled>打卡</button>
+    <label class="btn" id="photoBtn" style="display:none">拍照打卡<input id="photo" type="file" accept="image/*" capture="environment" hidden></label>
+  </div>
+  <div id="msg"></div>
+  <div class="btns" style="margin-top:8px">
+    <button id="logBtn" style="background:#555">開始紀錄 s</button>
+    <button id="csvBtn" style="background:#555" disabled>匯出 CSV</button>
+  </div>
+  <div id="logStats" style="font-family:ui-monospace,monospace;font-size:13px;color:var(--muted);margin-top:6px;white-space:pre-line"></div>
+  <label class="sim"><input type="checkbox" id="simToggle"> 模擬模式（點地圖 = 假裝走到那裡，桌前測試用）</label>
+</div>
+
+<script>
+// ---- 可調參數 ----
+// 2D 圓形模式
+const AREA_RADIUS = 50;   // 檢查點分布範圍（公尺）
+const CHECK_RADIUS = 20;  // 進入多近算「到了」；GPS 誤差常有 5–20m，別設太小
+const MIN_SPACING = 25;   // 檢查點彼此最小距離
+const NUM_POINTS = 3;
+// 1D 街道模式：中心 = 0，沿街方向為 +
+const STREET_HALF = 25;               // 前後各 25 m
+const STREET_POS = [-24, -8, 8, 24];  // 檢查點在街上的座標（公尺）；間距 16 m 已接近 GPS 誤差極限
+const ALONG_TOL = 8;                  // 沿街方向容許誤差（≤ 間距一半，區段才不重疊）
+const CROSS_TOL = 15;                 // 垂直街道方向容許誤差（對街、騎樓都算）
+
+const map = L.map('map').setView([25.0478, 121.5170], 17);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+let me = null, meMarker = null, accCircle = null, points = [], layers = [];
+let flags = 0;            // 旗標暫存器：第 i 位 = 檢查點 i 是否完成
+let street = null;        // { center, ux, uy }：1D 座標系
+let awaitingAxis = false; // 正在等使用者點地圖決定街道方向
+const $ = id => document.getElementById(id);
+const mode = () => document.querySelector('input[name=mode]:checked').value;
+
+function dist(a, b) { // 公尺（haversine）
+  const R = 6371000, r = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * r, dLng = (b.lng - a.lng) * r;
+  const h = Math.sin(dLat/2)**2 + Math.cos(a.lat*r)*Math.cos(b.lat*r)*Math.sin(dLng/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+function offset(o, dx, dy) { // dx 東、dy 北（公尺）
+  return { lat: o.lat + dy / 111320, lng: o.lng + dx / (111320 * Math.cos(o.lat * Math.PI / 180)) };
+}
+function toLocal(o, p) { // 反向：經緯度 → 以 o 為原點的公尺座標
+  return { x: (p.lng - o.lng) * 111320 * Math.cos(o.lat * Math.PI / 180), y: (p.lat - o.lat) * 111320 };
+}
+// 把 2D 位置投影成 1D：s = 沿街座標，t = 偏離街道距離
+function project(p) {
+  const v = toLocal(street.center, p);
+  return { s: v.x * street.ux + v.y * street.uy, t: -v.x * street.uy + v.y * street.ux };
+}
+
+// ---- s 值紀錄 ----
+let logging = false, log = [];
+function logFix(src) {
+  if (!logging || !street || street.ux === undefined) return;
+  const { s, t } = project(me);
+  log.push({ time: new Date().toISOString(), src, lat: me.lat, lng: me.lng, acc: me.acc, s, t });
+  renderLogStats();
+}
+function renderLogStats() {
+  $('csvBtn').disabled = !log.length;
+  if (!log.length) { $('logStats').textContent = logging ? '紀錄中，等待 GPS 更新…' : ''; return; }
+  const ss = log.map(r => r.s), n = ss.length;
+  const mean = ss.reduce((a, b) => a + b, 0) / n;
+  const sd = Math.sqrt(ss.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
+  const accs = log.map(r => r.acc).sort((a, b) => a - b);
+  const secs = (new Date(log[n-1].time) - new Date(log[0].time)) / 1000;
+  const f = x => (x >= 0 ? '+' : '') + x.toFixed(1);
+  $('logStats').textContent =
+    `${logging ? '● 紀錄中' : '■ 已停止'}　${n} 筆 / ${Math.round(secs)} 秒\n` +
+    `s 平均 ${f(mean)} m，標準差 ${sd.toFixed(1)} m，範圍 ${f(Math.min(...ss))} ~ ${f(Math.max(...ss))} m\n` +
+    `精度中位數 ±${accs[Math.floor(n / 2)].toFixed(0)} m` +
+    (n >= 10 ? `\n→ 標準差 ${sd <= ALONG_TOL / 2 ? '夠小，目前點距可用' : '偏大，建議拉大點距或街道長度'}（ALONG_TOL = ${ALONG_TOL} m）` : '');
+}
+$('logBtn').onclick = () => {
+  if (!logging && (!street || street.ux === undefined)) {
+    $('msg').textContent = '請先在街道模式按「開始」並設定街道方向，才有 s 座標可記錄'; return;
+  }
+  logging = !logging;
+  if (logging) log = [];
+  $('logBtn').textContent = logging ? '停止紀錄' : '開始紀錄 s';
+  renderLogStats();
+};
+$('csvBtn').onclick = () => {
+  const head = 'time,src,lat,lng,acc_m,s_m,t_m';
+  const rows = log.map(r => [r.time, r.src, r.lat.toFixed(7), r.lng.toFixed(7), r.acc.toFixed(1), r.s.toFixed(2), r.t.toFixed(2)].join(','));
+  const url = URL.createObjectURL(new Blob([head + '\n' + rows.join('\n')], { type: 'text/csv' }));
+  const a = Object.assign(document.createElement('a'), { href: url, download: `s-log-${log[0].time.replace(/[:.]/g, '-')}.csv` });
+  document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+};
+
+function setMe(lat, lng, acc, src = 'gps') {
+  me = { lat, lng, acc };
+  logFix(src);
+  if (!meMarker) {
+    meMarker = L.circleMarker([lat, lng], { radius: 8, color: '#2563eb', fillOpacity: 1 }).addTo(map);
+    accCircle = L.circle([lat, lng], { radius: acc, color: '#2563eb', weight: 1, fillOpacity: 0.1 }).addTo(map);
+  } else {
+    meMarker.setLatLng([lat, lng]); accCircle.setLatLng([lat, lng]).setRadius(acc);
+  }
+  let s = `精度 ±${Math.round(acc)} m${acc > 20 ? '（誤差偏大，結果可能不準）' : ''}`;
+  if (street && points.length) {
+    const { s: along, t } = project(me);
+    s += ` ｜ 街道座標 s = ${along >= 0 ? '+' : ''}${Math.round(along)} m，偏離 ${Math.abs(Math.round(t))} m`;
+  }
+  $('status').textContent = s;
+  update();
+}
+
+function generateRadius(origin) {
+  const pts = [];
+  let tries = 0;
+  while (pts.length < NUM_POINTS && tries++ < 500) {
+    const ang = Math.random() * 2 * Math.PI, r = 15 + Math.random() * (AREA_RADIUS - 15);
+    const p = offset(origin, r * Math.cos(ang), r * Math.sin(ang));
+    if (pts.every(q => dist(p, q) >= MIN_SPACING)) pts.push(p);
+  }
+  return pts;
+}
+function generateStreet() {
+  return STREET_POS.map(s => ({ ...offset(street.center, s * street.ux, s * street.uy), s }));
+}
+
+function isDone(i) { return (flags >> i) & 1; }
+
+function render() {
+  layers.forEach(l => map.removeLayer(l)); layers = [];
+  if (street && mode() === 'street' && points.length) {
+    const a = offset(street.center, -STREET_HALF * street.ux, -STREET_HALF * street.uy);
+    const b = offset(street.center,  STREET_HALF * street.ux,  STREET_HALF * street.uy);
+    layers.push(L.polyline([[a.lat, a.lng], [b.lat, b.lng]], { color: '#555', weight: 6, opacity: 0.5 }).addTo(map));
+  }
+  const r = mode() === 'street' ? ALONG_TOL : CHECK_RADIUS;
+  points.forEach((p, i) => {
+    const c = isDone(i) ? '#1a8f3c' : '#dc2626';
+    layers.push(L.circle([p.lat, p.lng], { radius: r, color: c, fillOpacity: 0.15 }).addTo(map));
+    layers.push(L.marker([p.lat, p.lng]).bindTooltip(`#${i+1}`, { permanent: true }).addTo(map));
+  });
+  $('list').innerHTML = points.map((p, i) => {
+    let d = '';
+    if (me) d = p.s !== undefined ? `s=${p.s > 0 ? '+' : ''}${p.s} m，還差 ${Math.round(Math.abs(project(me).s - p.s))} m`
+                                  : Math.round(dist(me, p)) + ' m';
+    return `<li class="${isDone(i) ? 'done' : ''}">${isDone(i) ? '✅' : '⬜'} 檢查點 #${i+1} ${isDone(i) ? '已完成' : d}</li>`;
+  }).join('');
+  $('flags').textContent = points.length
+    ? `flags = 0b${flags.toString(2).padStart(points.length, '0')}（目標 0b${'1'.repeat(points.length)}）` : '';
+}
+
+function nearbyPoint() {
+  if (!me || !points.length) return -1;
+  if (points[0].s !== undefined) {
+    const { s, t } = project(me);
+    if (Math.abs(t) > CROSS_TOL) return -1;
+    return points.findIndex((p, i) => !isDone(i) && Math.abs(s - p.s) <= ALONG_TOL);
+  }
+  return points.findIndex((p, i) => !isDone(i) && dist(me, p) <= CHECK_RADIUS);
+}
+
+function update() {
+  render();
+  const i = nearbyPoint();
+  $('checkin').disabled = i < 0;
+  $('photoBtn').style.display = i >= 0 ? '' : 'none';
+  if (i >= 0) $('msg').textContent = `你在檢查點 #${i+1} 範圍內，可以打卡`;
+}
+
+function complete(i, how) {
+  flags |= (1 << i);
+  $('msg').textContent = `檢查點 #${i+1} 完成（${how}）`;
+  update();
+  if (flags === (1 << points.length) - 1) {
+    $('msg').textContent = '🎉 全部檢查點完成，本次任務完成！';
+    if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+  }
+}
+
+function reset() {
+  points = []; flags = 0; street = null; awaitingAxis = false;
+  if (logging) { logging = false; $('logBtn').textContent = '開始紀錄 s'; renderLogStats(); } // 座標系變了，舊紀錄停在這裡
+  update();
+}
+
+$('start').onclick = () => {
+  if (!me) { $('msg').textContent = '還沒拿到定位，請允許位置權限或開模擬模式點地圖'; return; }
+  reset();
+  map.setView([me.lat, me.lng], 18);
+  $('start').textContent = '重新產生';
+  if (mode() === 'radius') {
+    points = generateRadius(me);
+    $('msg').textContent = `已在 ${AREA_RADIUS} m 內產生 ${points.length} 個檢查點，走過去吧`;
+    update();
+  } else {
+    street = { center: { lat: me.lat, lng: me.lng } };
+    awaitingAxis = true;
+    $('msg').textContent = '街道中心 = 目前位置。請在地圖上沿著街道「點一下」任一點，決定街道方向';
+  }
+};
+$('checkin').onclick = () => { const i = nearbyPoint(); if (i >= 0) complete(i, '按鈕'); };
+$('photo').onchange = e => {
+  const i = nearbyPoint();
+  if (e.target.files.length && i >= 0) complete(i, '拍照，位置已驗證；照片內容未驗證');
+  e.target.value = '';
+};
+document.querySelectorAll('input[name=mode]').forEach(r => r.onchange = () => { reset(); $('start').textContent = '開始'; $('msg').textContent = ''; });
+
+map.on('click', e => {
+  if (awaitingAxis) {
+    const v = toLocal(street.center, e.latlng), n = Math.hypot(v.x, v.y);
+    if (n < 3) { $('msg').textContent = '離中心太近，點遠一點（沿街方向）'; return; }
+    street.ux = v.x / n; street.uy = v.y / n; awaitingAxis = false;
+    points = generateStreet();
+    $('msg').textContent = `街道已設定，${points.length} 個檢查點在 s = ${STREET_POS.join(', ')} m`;
+    setMe(me.lat, me.lng, me.acc, 'axis-set');
+    return;
+  }
+  if ($('simToggle').checked) setMe(e.latlng.lat, e.latlng.lng, 5, 'sim');
+});
+
+// 真實 GPS
+if ('geolocation' in navigator) {
+  navigator.geolocation.watchPosition(
+    pos => { if (!$('simToggle').checked) setMe(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy); },
+    err => { $('status').textContent = '定位失敗：' + err.message + '（需 HTTPS 並允許位置權限）'; },
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
+  );
+}
+</script>
+</body>
+</html>
